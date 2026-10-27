@@ -1,0 +1,189 @@
+
+stages:
+  # Les étapes sont ordonnées : les jobs d'une étape attendent la précédente.
+  - code
+  - build
+  - security
+  - test
+  - release
+  - deploy
+  - rollback_notice
+
+workflow:
+  # N'exécute le pipeline que pour les pushes, merge requests et tags.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG'
+
+variables:
+  COMPOSER_ALLOW_SUPERUSER: "1"
+  # Chemin de release prévu sur le serveur de production.
+  DEPLOY_RELEASE: "$DEPLOY_PATH/releases/$CI_COMMIT_SHA"
+
+# Image et outils PHP partagés par les jobs de contrôle et de release.
+.php_job:
+  image: php:8.3-cli
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq git unzip libsqlite3-dev libzip-dev
+    - docker-php-ext-install pdo_sqlite zip
+    - php -r "copy('https://getcomposer.org/installer', '/tmp/composer-setup.php');"
+    - php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+    - composer --version
+    - php -m | grep -i pdo_sqlite
+
+# 1. CODE : contrôles de base
+# Valide la structure minimale du projet et la configuration Composer.
+code_check:
+  extends: .php_job
+  stage: code
+  script:
+    - test -f artisan
+    - test -f composer.json
+    - composer validate --no-check-publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_TAG'
+
+# 2. BUILD : installation des dépendances
+# L'artefact vendor est réutilisé par les jobs d'audit et de tests.
+build_app:
+  extends: .php_job
+  stage: build
+  script:
+    - composer install --prefer-dist --no-interaction --no-progress
+    - test -f vendor/autoload.php
+  artifacts:
+    paths:
+      - vendor/
+      - composer.lock
+    expire_in: 2 hours
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_TAG'
+
+# 3. SECURITY : audit des dépendances Composer
+# L'audit bloque le pipeline si une dépendance vulnérable est détectée.
+dependency_audit:
+  extends: .php_job
+  stage: security
+  needs:
+    - job: build_app
+      artifacts: true
+  script:
+    - composer audit --no-interaction
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_TAG'
+
+# 4. TEST : tests Laravel avec SQLite
+# Crée une base de test éphémère, applique les migrations et lance PHPUnit.
+test_app:
+  extends: .php_job
+  stage: test
+  needs:
+    - job: build_app
+      artifacts: true
+  script:
+    - cp .env.testing .env
+    - mkdir -p database
+    - touch database/database.sqlite
+    - php artisan key:generate --force
+    - php artisan config:clear
+    - php artisan migrate:fresh --env=testing --force
+    - php artisan test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_TAG'
+
+# 5. RELEASE : préparer l'archive de production
+# Cette étape est limitée à main et exclut la configuration et la base locale.
+release_app:
+  extends: .php_job
+  stage: release
+  script:
+    - composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+    - tar -czf /tmp/release.tar.gz
+        --exclude=.git
+        --exclude=.env
+        --exclude=.env.testing
+        --exclude=database/database.sqlite
+        --exclude=release.tar.gz
+        .
+    - cp /tmp/release.tar.gz release.tar.gz
+  artifacts:
+    paths:
+      - release.tar.gz
+    expire_in: 1 day
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# 6. DEPLOY : transfert et activation par SSH
+# Job manuel sur main ; les clés et hôtes SSH sont fournis par les variables CI.
+deploy_prod:
+  stage: deploy
+  image: alpine:3.22
+  needs:
+    - job: release_app
+      artifacts: true
+  before_script:
+    - apk add --no-cache openssh-client
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+    - chmod 600 ~/.ssh/known_hosts
+  script:
+    - |
+      set -eu
+
+      # Prépare une release isolée, puis active son lien current après migration.
+      REMOTE="$DEPLOY_USER@$DEPLOY_HOST"
+      REMOTE_RELEASE="$DEPLOY_PATH/releases/$CI_COMMIT_SHA"
+      ARCHIVE="release-$CI_COMMIT_SHA.tar.gz"
+
+      scp release.tar.gz "$REMOTE:/tmp/$ARCHIVE"
+
+      ssh "$REMOTE" \
+        "mkdir -p '$REMOTE_RELEASE' '$DEPLOY_PATH/shared/storage'"
+
+      ssh "$REMOTE" \
+        "tar -xzf '/tmp/$ARCHIVE' -C '$REMOTE_RELEASE' &&
+         rm -f '/tmp/$ARCHIVE'"
+
+      ssh "$REMOTE" \
+        "test -f '$DEPLOY_PATH/shared/.env'"
+
+      ssh "$REMOTE" \
+        "cd '$REMOTE_RELEASE' &&
+         ln -sfn '$DEPLOY_PATH/shared/.env' .env &&
+         rm -rf storage &&
+         ln -sfn '$DEPLOY_PATH/shared/storage' storage &&
+         mkdir -p bootstrap/cache &&
+         php artisan migrate --force &&
+         php artisan config:cache &&
+         ln -sfn '$REMOTE_RELEASE' '$DEPLOY_PATH/current'"
+
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+# Affiche un exemple de rollback uniquement si le déploiement de production échoue.
+rollback_notice:
+  stage: rollback_notice
+  needs:
+    - job: deploy_prod
+  script:
+    - |
+      echo "Exemple : le déploiement en production a échoué ; un rollback devrait être effectué."
+  when: on_failure
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'

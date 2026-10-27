@@ -1,0 +1,56 @@
+image: php:8.3-cli
+
+stages:
+  - installation
+  - tests
+  - securite
+
+variables:
+  COMPOSER_ALLOW_SUPERUSER: "1"
+  COMPOSER_CACHE_DIR: "$CI_PROJECT_DIR/.composer-cache"
+
+before_script:
+  - apt-get update
+  - apt-get install -y --no-install-recommends curl git libonig-dev libsqlite3-dev libxml2-dev unzip
+  - docker-php-ext-install mbstring pdo_sqlite xml
+  - curl -fsSL https://getcomposer.org/installer -o composer-setup.php
+  - EXPECTED_CHECKSUM="$(curl -fsSL https://composer.github.io/installer.sig)"
+  - ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
+  - test "$EXPECTED_CHECKSUM" = "$ACTUAL_CHECKSUM"
+  - php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+  - rm composer-setup.php
+
+cache:
+  key: composer
+  paths:
+    - .composer-cache/
+
+installation:
+  stage: installation
+  script:
+    - cp .env.example .env
+    - composer install --no-interaction --prefer-dist --no-progress
+    - php artisan key:generate --force
+  artifacts:
+    paths:
+      - composer.lock
+      - vendor/
+    expire_in: 1 hour
+
+tests:
+  stage: tests
+  needs:
+    - job: installation
+      artifacts: true
+  script:
+    - cp .env.example .env
+    - php artisan key:generate --force
+    - composer test
+
+audit-dependances:
+  stage: securite
+  needs:
+    - job: installation
+      artifacts: true
+  script:
+    - composer audit --no-interaction
